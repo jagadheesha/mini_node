@@ -1,70 +1,130 @@
-# Getting Started with Create React App
+# mini-node
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+`mini-node` is a small JavaScript runtime experiment built by embedding
+[QuickJS](https://bellard.org/quickjs/) for JavaScript execution and
+[libuv](https://libuv.org/) for timers, filesystem work, and the event loop.
+The goal is to make the boundary between a JavaScript engine and native
+asynchronous I/O easy to inspect.
 
-## Available Scripts
+> **Status:** This repository currently contains the project specification and
+> package metadata. The native runtime described below is the implementation
+> roadmap; the listed commands will become available as those files are added.
 
-In the project directory, you can run:
+## Architecture
 
-### `npm start`
+```text
+JavaScript source
+             |
+             v
+Native bindings (C) ---- JSRuntime / JSContext (QuickJS)
+             |
+             v
+libuv loop, timers, and filesystem worker pool
+```
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+The host owns one QuickJS runtime and context. Native functions are registered
+on `globalThis`, retain JavaScript callbacks with `JS_DupValue()`, and release
+those references with `JS_FreeValue()` after invocation. Once the initial script
+has returned, the host runs `uv_run(loop, UV_RUN_DEFAULT)`. libuv callbacks
+then re-enter QuickJS on the loop thread.
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+The runtime is intentionally single-threaded from JavaScript's perspective.
+libuv may perform filesystem work in its worker pool, but JavaScript callbacks
+must be dispatched back on the thread that owns the QuickJS context.
 
-### `npm test`
+## Public API
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+### `console.log(...values)`
 
-### `npm run build`
+Prints primitive values and strings to standard output. Values should be
+converted with QuickJS's value-to-string APIs and released after conversion.
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+### `performance.now()`
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+Returns a monotonic timestamp in milliseconds. It can be implemented from
+`uv_hrtime()` without using wall-clock time, so elapsed durations are not
+affected by system clock changes.
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+### `setTimeout(callback, delayMs)`
 
-### `npm run eject`
+Schedules a callback on a `uv_timer_t`. The binding validates that the first
+argument is callable and that the delay is non-negative, retains the callback
+until the timer fires, then frees the timer and callback resources.
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+### `mini.readFile(path, callback)`
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+Reads a file without blocking the JavaScript thread. The callback follows the
+shape `(error, data)`, where `data` is a byte array or string chosen by the
+binding contract. Every `uv_fs_t` request must be cleaned up, including error
+paths.
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+## Planned layout
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
+```text
+mini-node/
+├── CMakeLists.txt
+├── vendor/
+│   ├── quickjs/
+│   └── libuv/
+├── src/
+│   ├── main.c
+│   ├── runtime.h
+│   └── bindings/
+│       ├── console.c
+│       ├── timer.c
+│       └── fs.c
+└── examples/
+        └── test-async.js
+```
 
-## Learn More
+## Implementation plan
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+1. **Engine and evaluator:** initialize `JSRuntime` and `JSContext`, evaluate a
+     script supplied on the command line, and dispose both objects on every exit
+     path.
+2. **Host bindings:** expose `console.log()` and `performance.now()` with
+     argument validation and explicit QuickJS value ownership.
+3. **Timers:** connect `setTimeout()` to `uv_timer_t`, retain callbacks while
+     queued, and report JavaScript exceptions from `JS_Call()`.
+4. **Filesystem:** implement `mini.readFile()` with `uv_fs_*` requests,
+     callback error handling, and cleanup for open, read, and close operations.
+5. **Verification:** run the example below and add focused tests for callback
+     lifetime, timer ordering, missing files, and thrown callback exceptions.
 
-To learn React, check out the [React documentation](https://reactjs.org/).
+## Build prerequisites
 
-### Code Splitting
+- A C compiler with C11 support
+- CMake 3.16 or newer
+- libuv development headers and library, unless vendored
+- QuickJS source or a compatible development build
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
+The current `package.json` is metadata for the repository and is not the build
+system for the native runtime. Once `CMakeLists.txt` is present, the expected
+build flow is:
 
-### Analyzing the Bundle Size
+```sh
+cmake -S . -B build
+cmake --build build
+```
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
+## Verification example
 
-### Making a Progressive Web App
+`examples/test-async.js` should contain:
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
+```js
+console.log("1: Main script starts");
 
-### Advanced Configuration
+setTimeout(() => {
+    console.log("3: Timer callback executed");
+}, 50);
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
+mini.readFile("./package.json", (err, data) => {
+    if (err) console.log("File error:", err);
+    else console.log("4: Async file I/O finished, bytes:", data.length);
+});
 
-### Deployment
+console.log("2: Main script finishes, entering event loop");
+```
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+The first two lines must print synchronously. The timer and filesystem lines
+may appear in either order because they are independent asynchronous tasks.
